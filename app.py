@@ -54,7 +54,9 @@ CORS(app)
 
 # Database Configuration
 basedir = os.path.abspath(os.path.dirname(__file__))
-app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///' + os.path.join(basedir, 'emails.db')
+# Change DB configuration to use the production variable
+app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get('DATABASE_URL')
+# Your other configurations remain the same
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
 db = SQLAlchemy(app)
@@ -197,3 +199,4 @@ def get_all_emails():
 if __name__ == '__main__':
 
     app.run(debug=True)
+
