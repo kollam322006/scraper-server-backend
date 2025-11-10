@@ -23,8 +23,12 @@ if __name__ == '__main__':
     # Flask application context is required for SQLAlchemy (db.session) to work inside the worker
     from app import app
     with app.app_context():
-        # Initialize the worker, passing the queue list and the connection object
-        # This setup correctly handles the Redis connection without needing a specific 'Connection' import
-        worker = Worker(list(map(Queue, listen)), connection=conn)
+        # 1. Correctly create the Queue objects *with* the connection
+        #    before passing them to the Worker.
+        queues = [Queue(name, connection=conn) for name in listen]
+
+        # 2. Initialize the worker with the list of initialized Queue objects
+        worker = Worker(queues, connection=conn) 
+        
         print("Starting RQ Worker...")
         worker.work()
