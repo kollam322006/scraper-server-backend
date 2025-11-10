@@ -3,8 +3,7 @@ gunicorn
 requests
 beautifulsoup4
 lxml
-Flask-CORS
-Flask-SQLAlchemy
-psycopg2-binary
-rq
 redis
+rq
+Flask-SQLAlchemy
+Flask-CORS
