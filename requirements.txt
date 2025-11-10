@@ -6,3 +6,5 @@ lxml
 Flask-CORS
 Flask-SQLAlchemy
 psycopg2-binary
+rq
+redis
