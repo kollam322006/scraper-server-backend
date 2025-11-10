@@ -16,7 +16,8 @@ from rq import Queue
 
 # XLSX library imports
 from openpyxl import Workbook
-from openpyxl.writer.write_only import save_virtual_workbook # CORRECTED IMPORT PATH
+# FINAL CORRECTED IMPORT PATH for save_virtual_workbook in openpyxl 3.x
+from openpyxl.writer.excel import save_virtual_workbook 
 from io import BytesIO
 
 # --- Configuration ---
@@ -262,7 +263,7 @@ def get_batch_emails(batch_id):
             
         return jsonify([e.to_dict() for e in emails]), 200
 
-# --- NEW FEATURE: BATCH RENAMING ---
+# --- NEW FEATURE: BATCH RENAMING (PATCH) ---
 @app.route('/batches/<int:batch_id>', methods=['PATCH'])
 def update_batch(batch_id):
     """Updates the name of a specific batch."""
@@ -289,7 +290,7 @@ def update_batch(batch_id):
             db.session.rollback()
             return jsonify({"error": f"Failed to rename batch: {str(e)}"}), 500
 
-# --- NEW FEATURE: EMAIL EDITING ---
+# --- NEW FEATURE: EMAIL EDITING (PATCH) ---
 @app.route('/emails/<int:email_id>', methods=['PATCH'])
 def update_email(email_id):
     """Updates the address and/or source domain of a specific email."""
@@ -321,7 +322,7 @@ def update_email(email_id):
             db.session.rollback()
             return jsonify({"error": f"Failed to update email: {str(e)}"}), 500
 
-# --- NEW FEATURE: MASS EMAIL DELETION ---
+# --- NEW FEATURE: MASS EMAIL DELETION (DELETE) ---
 @app.route('/emails/delete', methods=['DELETE'])
 def delete_emails():
     """Deletes selected individual emails from the database."""
