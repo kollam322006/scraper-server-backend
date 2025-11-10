@@ -1,102 +1,116 @@
-# scraper_tasks.py
+# scraper_tasks.py (Database Model and Scraping Logic)
 
-import os
-import re
-import requests
-from urllib.parse import urlparse, urljoin 
-
-from flask import Flask
 from flask_sqlalchemy import SQLAlchemy
+from sqlalchemy import Column, Integer, String
+import requests
+from bs4 import BeautifulSoup
+import re
+from urllib.parse import urlparse, urljoin
+import time
 
-# --- FLASK AND DATABASE SETUP ---
-# The worker needs a minimal Flask app context and the DB URL
-app = Flask(__name__)
-# Get the DB URL from the environment (Render's linked PostgreSQL)
-app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get('DATABASE_URL')
-app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-db = SQLAlchemy(app)
+# Initialize SQLAlchemy
+db = SQLAlchemy()
 
-# Database Model (Must be defined here for the worker)
+# --- Database Model ---
 class Email(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    email_address = db.Column(db.String(120), unique=True, nullable=False)
-    source_url = db.Column(db.String(500), nullable=False)
-    
-# --- UTILITY FUNCTIONS ---
+    id = Column(Integer, primary_key=True)
+    email_address = Column(String(120), unique=True, nullable=False)
+    source_url = Column(String(255), nullable=False)
 
-def sanitize_url(raw_url):
-    """Removes common prefixes and ensures a clean https:// prefix."""
-    url = raw_url.strip().lower()
-    
-    if url.startswith('https://'):
-        url = url[8:]
-    elif url.startswith('http://'):
-        url = url[7:]
-    if url.startswith('www.'):
-        url = url[4:]
-    
-    return f"https://{url}"
+    def __repr__(self):
+        return f'<Email {self.email_address}>'
 
-def generate_crawl_list(sanitized_url):
-    """Generates the base URL and two policy links from a sanitized domain."""
-    parsed = urlparse(sanitized_url)
-    root_domain = f"{parsed.scheme}://{parsed.netloc}"
-    
-    urls_to_visit = [
-        root_domain, 
-        urljoin(root_domain, '/policies/contact-information'),
-        urljoin(root_domain, '/policies/privacy-policy')
-    ]
-    return urls_to_visit
+# --- Scraping Logic ---
 
-# --- SCRAPER TASK WORKER ---
+# Regex pattern to find emails
+EMAIL_REGEX = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
 
-def run_batch_scrape_task(raw_input_urls):
-    """The main scraping function, now runnable by RQ."""
-    
-    # All database operations MUST be within the app_context() when run by RQ
-    
-    raw_links = [link.strip() for link in raw_input_urls.split('\n') if link.strip()]
-    
-    emails_saved_count = 0
-    
-    # Initialize DB tables if they don't exist (important for the first run)
-    with app.app_context():
-        db.create_all()
+def extract_emails_from_text(text):
+    """Finds all unique emails in a given block of text."""
+    return set(re.findall(EMAIL_REGEX, text))
 
-    for raw_link in raw_links:
-        sanitized_domain = sanitize_url(raw_link)
-        links_to_scrape = generate_crawl_list(sanitized_domain)
+def scrape_url_for_emails(url, session):
+    """Scrapes a single URL and saves any unique emails found to the database."""
+    print(f"Scraping: {url}")
+    found_emails_count = 0
+    try:
+        # Simple backoff to avoid hammering sites
+        time.sleep(0.5) 
         
-        for url_to_scrape in links_to_scrape:
-            try:
-                headers = {'User-Agent': 'Mozilla/5.0'}
-                response = requests.get(url_to_scrape, headers=headers, timeout=15) # Increased timeout
-                response.raise_for_status() 
-                html_content = response.text
-
-                email_pattern = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
-                found_emails = set(re.findall(email_pattern, html_content))
-                
-                with app.app_context():
-                    for email_address in found_emails:
-                        # Use select statement for robust checking
-                        exists = db.session.execute(
-                            db.select(Email).filter_by(email_address=email_address)
-                        ).scalar_one_or_none()
-                        
-                        if not exists:
-                            new_email = Email(email_address=email_address, source_url=url_to_scrape)
-                            db.session.add(new_email)
-                            emails_saved_count += 1
-                    
-                    db.session.commit()
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)',
+            'Accept-Language': 'en-US,en;q=0.5'
+        }
+        
+        response = session.get(url, headers=headers, timeout=10)
+        response.raise_for_status() # Raise exception for 4xx/5xx errors
+        
+        soup = BeautifulSoup(response.text, 'lxml')
+        page_text = soup.get_text()
+        
+        unique_emails = extract_emails_from_text(page_text)
+        
+        # Save unique emails to the database
+        for email_address in unique_emails:
+            # Check if email already exists before inserting
+            existing_email = db.session.execute(
+                db.select(Email).filter_by(email_address=email_address)
+            ).scalar_one_or_none()
             
-            except requests.exceptions.RequestException as e:
-                # Use print() or logging in RQ task to see errors in worker logs
-                print(f"ERROR: Failed to scrape {url_to_scrape}. Error: {e}")
-            except Exception as e:
-                print(f"CRITICAL ERROR: Unexpected error while processing {url_to_scrape}. Error: {e}")
+            if not existing_email:
+                new_email = Email(email_address=email_address, source_url=url)
+                db.session.add(new_email)
+                found_emails_count += 1
                 
-    # Return a final message that can be retrieved by the API's /status endpoint
-    return f"Scraping complete. Total unique emails saved: {emails_saved_count}"
+        db.session.commit()
+        
+    except requests.exceptions.RequestException as e:
+        print(f"Error accessing {url}: {e}")
+        db.session.rollback()
+    except Exception as e:
+        print(f"General error on {url}: {e}")
+        db.session.rollback()
+        
+    return found_emails_count
+
+def run_batch_scrape_task(raw_urls_string):
+    """Main task function executed by the RQ Worker."""
+    
+    # Needs to be imported inside the worker function to avoid circular import issues
+    from app import app
+    
+    # Process input: clean and normalize domains/URLs
+    domains = [u.strip() for u in raw_urls_string.split('\n') if u.strip()]
+    
+    # Target paths relative to the domain root
+    paths_to_check = [
+        '/',
+        '/policies/contact-information',
+        '/policies/privacy-policy'
+    ]
+    
+    total_saved_emails = 0
+    
+    with app.app_context():
+        with requests.Session() as session:
+            
+            for domain in domains:
+                
+                # Normalize domain/link to start with http or https if needed
+                if not domain.startswith(('http://', 'https://')):
+                    domain = f'https://{domain}'
+
+                parsed_domain = urlparse(domain)
+                base_url = f"{parsed_domain.scheme}://{parsed_domain.netloc}"
+
+                print(f"Starting check for domain: {base_url}")
+                
+                for path in paths_to_check:
+                    target_url = urljoin(base_url, path)
+                    
+                    # Only scrape the base domain or the specific paths under it
+                    if target_url.startswith(base_url):
+                        saved_count = scrape_url_for_emails(target_url, session)
+                        total_saved_emails += saved_count
+            
+    return f"Batch scrape finished. Saved {total_saved_emails} unique email(s)."
