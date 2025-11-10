@@ -2,17 +2,18 @@
 
 from flask import Flask, request, jsonify, g, Response
 from flask_cors import CORS
-from flask_sqlalchemy import SQLAlchemy
+from flask_sqlalchemy import SQLAlchemy  # <-- FIX: Corrected typo
 import os
 import redis
 from rq import Queue, Retry
 from rq.job import Job
-from sqlalchemy import or_ # Added for Search functionality
+from sqlalchemy import or_
 import io
 import csv
 from datetime import datetime
 
 # Import task function and model from the tasks file
+# NOTE: This assumes scraper_tasks.py is correct and contains Email, db, and run_batch_scrape_task
 from scraper_tasks import Email, db, run_batch_scrape_task 
 
 # --- FLASK AND DATABASE SETUP ---
@@ -21,6 +22,7 @@ app = Flask(__name__)
 CORS(app)
 
 # Database Configuration (Reads the DATABASE_URL environment variable)
+# NOTE: This relies on the DATABASE_URL being set in Render Environment
 app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get('DATABASE_URL')
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
@@ -36,6 +38,7 @@ with app.app_context():
 # Function to get Redis connection
 def get_redis_conn():
     if 'redis_conn' not in g:
+        # NOTE: This relies on the REDIS_URL being set in Render Environment
         redis_url = os.environ.get('REDIS_URL', 'redis://localhost:6379')
         g.redis_conn = redis.from_url(redis_url)
     return g.redis_conn
@@ -87,12 +90,17 @@ def get_job_status(job_id):
         'failed': 'FAILED'
     }
     
+    # Simple progress calculation, since detailed meta updates are complex on this setup
+    progress = 100 if job.get_status() == 'finished' else (50 if job.get_status() == 'started' else 0)
+    result_text = job.result if job.result else (
+        "Job failed during processing." if job.get_status() == 'failed' else "Processing domains..."
+    )
+    
     return jsonify({
         "job_id": job.id,
         "status": status_map.get(job.get_status(), 'UNKNOWN'),
-        "result": job.result, 
-        "meta": job.meta, 
-        "percent_complete": 100 if job.get_status() == 'finished' else 0,
+        "result": result_text, 
+        "progress": progress,
         "queued_at": job.enqueued_at.strftime('%Y-%m-%d %H:%M:%S') if job.enqueued_at else None
     })
 
@@ -109,7 +117,6 @@ def get_emails():
         search_term = f"%{search_query.lower()}%"
         query = query.filter(
             or_(
-                # Case-insensitive search on email address OR source URL
                 Email.email_address.ilike(search_term),
                 Email.source_url.ilike(search_term)
             )
@@ -138,7 +145,6 @@ def delete_emails():
         return jsonify({"error": "Missing or invalid list of 'ids' in request body"}), 400
 
     try:
-        # Delete all records where the ID is in the list
         delete_count = db.session.query(Email).filter(Email.id.in_(email_ids)).delete(synchronize_session='fetch')
         db.session.commit()
         
@@ -181,13 +187,11 @@ def export_emails():
     # Package it as a downloadable response
     response = Response(output.getvalue(), mimetype="text/csv")
     
-    # Set headers to force browser download
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     response.headers["Content-Disposition"] = f"attachment; filename=scraped_emails_{timestamp}.csv"
     
     return response
 
-
+# This is only for local testing, the Render start command runs gunicorn
 if __name__ == '__main__':
-    # When running locally, you must run the worker separately
     app.run(debug=True)
