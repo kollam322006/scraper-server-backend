@@ -8,3 +8,4 @@ rq
 Flask-SQLAlchemy
 Flask-CORS
 psycopg2-binary
+openpyxl  <-- NEW: For XLSX export
