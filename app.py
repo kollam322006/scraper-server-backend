@@ -1,3 +1,4 @@
+import io # New import needed for BytesIO handling
 import os
 import time
 import json
@@ -16,9 +17,21 @@ from rq import Queue
 
 # XLSX library imports
 from openpyxl import Workbook
-# FINAL CORRECTED IMPORT PATH for save_virtual_workbook in openpyxl 3.x
-from openpyxl.writer.excel import save_virtual_workbook 
-from io import BytesIO
+from io import BytesIO # Also ensure BytesIO is imported from the standard library's io module
+
+# --- FIX FOR OPENPYXL IMPORT ERROR ---
+def save_virtual_workbook(workbook):
+    """
+    Replacement function for the removed openpyxl.writer.excel.save_virtual_workbook.
+    It saves the workbook content to an in-memory BytesIO object.
+    """
+    virtual_file = io.BytesIO()
+    # Use the standard save method, which accepts file-like objects
+    workbook.save(virtual_file)
+    # Return the byte content, just like the old function did
+    return virtual_file.getvalue()
+# --- END FIX ---
+
 
 # --- Configuration ---
 app = Flask(__name__)
@@ -95,6 +108,9 @@ def scrape_task(batch_id, urls):
     """
     Background task to scrape a list of URLs and save emails to the database.
     """
+    # NOTE: This function needs to be in worker.py as well, or imported by it.
+    # Ensure worker.py is also updated with the 'save_virtual_workbook' fix if it imports app.py!
+    
     with app.app_context():
         batch = db.session.get(Batch, batch_id)
         if not batch:
@@ -403,7 +419,7 @@ def export_batch_xlsx(batch_id):
             ]
             ws.append(row)
 
-        # Save the workbook to an in-memory file
+        # Save the workbook to an in-memory file using the fixed helper function
         virtual_file = save_virtual_workbook(wb)
 
         # Prepare the response
