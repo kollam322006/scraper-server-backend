@@ -2,8 +2,8 @@
 
 import os
 import redis
-from rq import Worker, Queue, Connection  # <-- FIX: Ensure Connection is imported correctly
-
+from rq import Worker, Queue 
+from rq.connection import Connection # <-- FIX: Import Connection from the correct submodule
 # Import your database and task functions
 from scraper_tasks import db, Email
 
