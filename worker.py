@@ -1,34 +1,32 @@
-# worker.py (The RQ Worker process)
-
 import os
+import sys
 import redis
-# FIX: Only import Worker and Queue from rq to avoid the ImportError
-from rq import Worker, Queue 
+from rq import Worker, Connection
 
-# Import your database and task functions (needed to run tasks inside worker context)
-from scraper_tasks import db, Email
+# We attempt to import the necessary components (the worker task and the
+# Redis connection object) from the now-fixed 'app.py'.
+try:
+    # Import the worker function (scrape_task), the Redis connection object, 
+    # and the Flask app instance (app) to provide necessary context for DB operations.
+    from app import scrape_task, redis_conn, app 
+except ImportError as e:
+    print(f"Error importing dependencies from app.py: {e}")
+    # Exit gracefully if dependencies can't be loaded
+    sys.exit(1)
 
-listen = ['default']
 
-# Get the REDIS_URL from the environment variables
-redis_url = os.environ.get('REDIS_URL')
-
-if not redis_url:
-    raise RuntimeError("REDIS_URL not set in environment.")
-
-# Use the redis library to create the connection object
-conn = redis.from_url(redis_url)
+# Define the queue(s) this worker will listen to
+LISTEN = ['default'] 
 
 if __name__ == '__main__':
-    # Flask application context is required for SQLAlchemy (db.session) to work inside the worker
-    from app import app
-    with app.app_context():
-        # 1. Correctly create the Queue objects *with* the connection
-        #    before passing them to the Worker.
-        queues = [Queue(name, connection=conn) for name in listen]
-
-        # 2. Initialize the worker with the list of initialized Queue objects
-        worker = Worker(queues, connection=conn) 
+    # We use the redis_conn object imported from app.py
+    print("Starting RQ Worker...")
+    
+    # The Connection context manager ensures the worker uses the correct Redis settings.
+    with Connection(redis_conn):
+        # We create the Worker instance, listening to the defined queue(s).
+        # When tasks run, they will have access to the functions and models defined in app.py.
+        worker = Worker(LISTEN, connection=redis_conn)
         
-        print("Starting RQ Worker...")
+        # Start the worker process
         worker.work()
