@@ -1,7 +1,8 @@
 import os
 import sys
 import redis
-from rq import Worker, Connection
+# Removed 'Connection' which caused the ImportError, as it is not needed here.
+from rq import Worker 
 
 # We attempt to import the necessary components (the worker task and the
 # Redis connection object) from the now-fixed 'app.py'.
@@ -22,11 +23,9 @@ if __name__ == '__main__':
     # We use the redis_conn object imported from app.py
     print("Starting RQ Worker...")
     
-    # The Connection context manager ensures the worker uses the correct Redis settings.
-    with Connection(redis_conn):
-        # We create the Worker instance, listening to the defined queue(s).
-        # When tasks run, they will have access to the functions and models defined in app.py.
-        worker = Worker(LISTEN, connection=redis_conn)
-        
-        # Start the worker process
-        worker.work()
+    # The 'with Connection(redis_conn):' block has been removed as it caused an ImportError.
+    # The connection is passed directly to the Worker constructor below.
+    worker = Worker(LISTEN, connection=redis_conn)
+    
+    # Start the worker process
+    worker.work()
