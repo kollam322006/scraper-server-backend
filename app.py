@@ -1,11 +1,12 @@
-import io # New import needed for BytesIO handling
+import io 
 import os
 import time
 import json
 import requests
+import re 
 from datetime import datetime
 from bs4 import BeautifulSoup
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 
 from flask import Flask, jsonify, request, send_file
 from flask_cors import CORS
@@ -17,7 +18,7 @@ from rq import Queue
 
 # XLSX library imports
 from openpyxl import Workbook
-from io import BytesIO # Also ensure BytesIO is imported from the standard library's io module
+from io import BytesIO 
 
 # --- FIX FOR OPENPYXL IMPORT ERROR ---
 def save_virtual_workbook(workbook):
@@ -26,20 +27,17 @@ def save_virtual_workbook(workbook):
     It saves the workbook content to an in-memory BytesIO object.
     """
     virtual_file = io.BytesIO()
-    # Use the standard save method, which accepts file-like objects
     workbook.save(virtual_file)
-    # Return the byte content, just like the old function did
     return virtual_file.getvalue()
 # --- END FIX ---
 
 
 # --- Configuration ---
 app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": "*"}}) # Allow all origins for the frontend
+CORS(app, resources={r"/*": {"origins": "*"}}) 
 
 # Database Configuration (Assuming PostgreSQL on Render)
 DATABASE_URL = os.environ.get('DATABASE_URL', 'postgresql://user:password@localhost/emails')
-# SQLAlchemy recommends changing the postgres:// scheme to postgresql://
 if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 app.config['SQLALCHEMY_DATABASE_URI'] = DATABASE_URL
@@ -64,7 +62,7 @@ class Batch(db.Model):
     domains_processed = db.Column(db.Integer, default=0)
     total_domains = db.Column(db.Integer, default=0)
     
-    # Relationship to emails
+    # Cascade ensures that when a Batch is deleted, all associated Emails are also deleted.
     emails = db.relationship('Email', backref='batch', lazy='dynamic', cascade="all, delete-orphan")
 
     def to_dict(self):
@@ -84,7 +82,7 @@ class Email(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     batch_id = db.Column(db.Integer, db.ForeignKey('batches.id'), nullable=False)
     email_address = db.Column(db.String(255), nullable=False, index=True)
-    source_url = db.Column(db.String(512), nullable=False)
+    source_url = db.Column(db.String(512), nullable=False) # Stores the BASE URL for grouping
     source_domain_name = db.Column(db.String(255), nullable=False, index=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
@@ -107,14 +105,14 @@ with app.app_context():
 def scrape_task(batch_id, urls):
     """
     Background task to scrape a list of URLs and save emails to the database.
+    'urls' is a list of tuples: (url_to_scrape, base_domain_url_to_save)
     """
-    # NOTE: This function needs to be in worker.py as well, or imported by it.
-    # Ensure worker.py is also updated with the 'save_virtual_workbook' fix if it imports app.py!
-    
+    print(f"[DEBUG] Worker started for Batch ID: {batch_id}")
+
     with app.app_context():
         batch = db.session.get(Batch, batch_id)
         if not batch:
-            print(f"Batch {batch_id} not found, stopping task.")
+            print(f"[ERROR] Batch {batch_id} not found, stopping task.")
             return
 
         total_urls = len(urls)
@@ -124,58 +122,128 @@ def scrape_task(batch_id, urls):
         processed_count = 0
         all_emails = set()
 
-        for url in urls:
+        for url_to_scrape, base_domain_url_to_save in urls:
             try:
+                print(f"[DEBUG] Processing URL: {url_to_scrape} (Grouping under: {base_domain_url_to_save})")
+                
                 # 1. Fetch content
-                response = requests.get(url, timeout=10)
+                response = requests.get(url_to_scrape, timeout=10)
                 response.raise_for_status() # Raise exception for bad status codes (4xx or 5xx)
                 
                 # 2. Parse content
                 soup = BeautifulSoup(response.text, 'lxml')
                 text = soup.get_text()
                 
-                # 3. Email extraction (simple regex for demonstration, more robust needed in production)
-                import re
+                # 3. Email extraction
                 emails_found = set(re.findall(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', text))
                 
                 # 4. Filter and save unique emails to database
-                domain = urlparse(url).netloc
+                domain_to_save = urlparse(base_domain_url_to_save).netloc
+                
                 for email_address in emails_found:
-                    # Check if email is already in the batch
+                    # Check if email is already in the batch (uniqueness check: email + base URL)
                     exists = db.session.execute(
-                        db.select(Email).filter_by(batch_id=batch_id, email_address=email_address)
+                        db.select(Email).filter_by(batch_id=batch_id, 
+                                                  email_address=email_address,
+                                                  source_url=base_domain_url_to_save)
                     ).scalar_one_or_none()
                     
                     if not exists:
                         new_email = Email(
                             batch_id=batch_id,
                             email_address=email_address,
-                            source_url=url,
-                            source_domain_name=domain
+                            source_url=base_domain_url_to_save,
+                            source_domain_name=domain_to_save
                         )
                         db.session.add(new_email)
                         all_emails.add(email_address)
+                        print(f"[DEBUG] SAVED new email: {email_address} (Source: {base_domain_url_to_save})")
 
+                # Commit changes after processing all emails for this URL
                 db.session.commit()
 
             except requests.exceptions.RequestException as e:
-                print(f"Request failed for {url}: {e}")
+                print(f"[ERROR] Request failed for {url_to_scrape}: {e}")
+                # Rollback any pending operations before the commit failure
+                db.session.rollback()
             except Exception as e:
-                print(f"An unexpected error occurred for {url}: {e}")
+                print(f"[FATAL] An unexpected error occurred while processing {url_to_scrape}: {e}")
+                # Rollback any pending operations before the commit failure
+                db.session.rollback()
             
             finally:
                 processed_count += 1
                 # Update status in the database after processing each URL
                 batch.domains_processed = processed_count
                 batch.status = 'RUNNING'
-                db.session.commit()
+                try:
+                    db.session.commit()
+                except Exception as e:
+                    print(f"[FATAL] Failed to commit batch status update for {base_domain_url_to_save}: {e}")
+                    db.session.rollback()
+
 
         # Final update
         batch.status = 'COMPLETED'
         batch.domains_processed = total_urls
         db.session.commit()
         
+        print(f"[DEBUG] Batch '{batch.batch_name}' finished. Found {len(all_emails)} unique emails in this run.")
         return f"Batch '{batch.batch_name}' finished. Found {len(all_emails)} unique emails."
+
+# --- URL Preprocessing Function ---
+def sanitize_and_expand_urls(raw_urls_string):
+    """
+    Takes a raw string of domains/URLs, sanitizes them, and expands each domain 
+    into a list of specific target URLs for scraping.
+    """
+    TARGET_SUFFIXES = [
+        "", # For the original link / homepage
+        "/policies/privacy-policy",
+        "/policies/contact-information"
+    ]
+    
+    urls_to_scrape_and_save_as = [] 
+    raw_links = [u.strip() for u in raw_urls_string.split('\n') if u.strip()]
+
+    for link in raw_links:
+        try:
+            # 1. Ensure a scheme exists for parsing
+            if '://' not in link:
+                link = 'https://' + link
+
+            # 2. Parse the URL
+            parsed_url = urlparse(link)
+            
+            # 3. Sanitize the network location (netloc) to remove 'www.'
+            netloc = parsed_url.netloc.replace('www.', '')
+
+            # 4. Force scheme to HTTPS
+            scheme = 'https'
+            
+            # 5. Determine the Base Domain URL (This is the URL we will save emails against)
+            base_url_parts = (scheme, netloc, '', '', '', '')
+            base_domain_url = urlunparse(base_url_parts)
+            
+            # 6. Expand into target URLs (3 total: base + two suffixes)
+            for suffix in TARGET_SUFFIXES:
+                # Use urlunparse with the suffix in the path part
+                target_url_parts = (scheme, netloc, suffix, '', '', '')
+                url_to_scrape = urlunparse(target_url_parts)
+                
+                # Append the tuple: (URL to fetch, Base URL for saving)
+                urls_to_scrape_and_save_as.append((url_to_scrape, base_domain_url))
+
+        except Exception as e:
+            print(f"[ERROR] Skipping invalid URL or link format: {link}. Error: {e}")
+            continue
+
+    # Convert to set and back to list to ensure uniqueness of the (scrape URL, base URL) pair
+    final_urls = list(set(urls_to_scrape_and_save_as))
+    print(f"[DEBUG] Generated {len(final_urls)} target URLs from {len(raw_links)} raw inputs.")
+    return final_urls
+# --- END URL Preprocessing Function ---
+
 
 # --- API Endpoints ---
 
@@ -189,10 +257,10 @@ def start_batch_scrape():
     if not urls_raw:
         return jsonify({"error": "No URLs provided"}), 400
 
-    # Clean and split URLs
-    urls = [u.strip() for u in urls_raw.split('\n') if u.strip()]
+    urls = sanitize_and_expand_urls(urls_raw)
+
     if not urls:
-        return jsonify({"error": "No valid URLs provided"}), 400
+        return jsonify({"error": "No valid URLs were processed after sanitation and expansion."}), 400
 
     with app.app_context():
         # 1. Create a new Batch record
@@ -213,7 +281,8 @@ def start_batch_scrape():
             "batch_id": batch_id,
             "batch_name": batch_name,
             "job_id": job.id,
-            "status": "QUEUED"
+            "status": "QUEUED",
+            "urls_to_be_scraped": len(urls) 
         }), 202
 
 
@@ -258,10 +327,8 @@ def get_batch_emails(batch_id):
     query_string = request.args.get('q', '').lower()
     
     with app.app_context():
-        # Base query
         email_query = Email.query.filter_by(batch_id=batch_id)
         
-        # Apply search filter
         if query_string:
             search = f"%{query_string}%"
             email_query = email_query.filter(
@@ -279,10 +346,12 @@ def get_batch_emails(batch_id):
             
         return jsonify([e.to_dict() for e in emails]), 200
 
-# --- NEW FEATURE: BATCH RENAMING (PATCH) ---
 @app.route('/batches/<int:batch_id>', methods=['PATCH'])
 def update_batch(batch_id):
-    """Updates the name of a specific batch."""
+    """
+    [RENAMING BATCHES]
+    Updates the name of a specific batch.
+    """
     data = request.get_json()
     new_name = data.get('batch_name')
 
@@ -306,13 +375,15 @@ def update_batch(batch_id):
             db.session.rollback()
             return jsonify({"error": f"Failed to rename batch: {str(e)}"}), 500
 
-# --- NEW FEATURE: EMAIL EDITING (PATCH) ---
 @app.route('/emails/<int:email_id>', methods=['PATCH'])
 def update_email(email_id):
-    """Updates the address and/or source domain of a specific email."""
+    """
+    [EDITING EMAILS]
+    Updates the address and/or source domain of a specific email.
+    """
     data = request.get_json()
     new_address = data.get('email_address')
-    new_domain = data.get('source_domain')
+    new_domain = data.get('source_domain') 
 
     if not new_address and not new_domain:
         return jsonify({"error": "No fields provided for update"}), 400
@@ -338,34 +409,38 @@ def update_email(email_id):
             db.session.rollback()
             return jsonify({"error": f"Failed to update email: {str(e)}"}), 500
 
-# --- NEW FEATURE: MASS EMAIL DELETION (DELETE) ---
 @app.route('/emails/delete', methods=['DELETE'])
 def delete_emails():
-    """Deletes selected individual emails from the database."""
+    """
+    [DELETING SELECTED EMAILS]
+    Deletes selected individual emails from the database by a list of IDs.
+    """
     data = request.get_json()
     email_ids = data.get('ids')
 
     if not email_ids or not isinstance(email_ids, list):
-        return jsonify({"error": "Missing or invalid list of 'ids' in request body"}), 400
+        return jsonify({"error": "Missing required field: provide a list of 'ids' for deletion."}), 400
 
     try:
-        # Delete emails where the ID is in the provided list
         delete_count = db.session.query(Email).filter(Email.id.in_(email_ids)).delete(synchronize_session='fetch')
         db.session.commit()
         
         if delete_count == 0:
-            return jsonify({"message": "No emails found with the provided IDs.", "deleted_ids": []}), 404
+            return jsonify({"message": "No emails found with the provided IDs.", "deleted_count": 0}), 404
 
-        return jsonify({"message": f"Successfully deleted {delete_count} email(s).", "deleted_ids": email_ids}), 200
+        return jsonify({"message": f"Successfully deleted {delete_count} email(s) by ID.", "deleted_count": delete_count}), 200
         
     except Exception as e:
         db.session.rollback()
         return jsonify({"error": f"Failed to delete emails: {str(e)}"}), 500
-
-# --- EXISTING FEATURE: BATCH DELETION ---
+        
+    
 @app.route('/batches/delete', methods=['DELETE'])
 def delete_batches():
-    """Deletes batches and all associated emails."""
+    """
+    [DELETING BATCHES]
+    Deletes batches by a list of IDs and all associated emails via cascading relationship.
+    """
     data = request.get_json()
     batch_ids = data.get('ids')
 
@@ -373,7 +448,6 @@ def delete_batches():
         return jsonify({"error": "Missing or invalid list of 'ids' in request body"}), 400
 
     try:
-        # SQLAlchemy cascade="all, delete-orphan" handles Email deletion automatically
         delete_count = db.session.query(Batch).filter(Batch.id.in_(batch_ids)).delete(synchronize_session='fetch')
         db.session.commit()
 
@@ -387,10 +461,12 @@ def delete_batches():
         return jsonify({"error": f"Failed to delete batches: {str(e)}"}), 500
 
 
-# --- EXISTING FEATURE: XLSX EXPORT ---
 @app.route('/batches/export/xlsx/<int:batch_id>', methods=['GET'])
 def export_batch_xlsx(batch_id):
-    """Generates and returns an XLSX file for a specific batch."""
+    """
+    [EXPORTING XLSX]
+    Generates and returns an XLSX file for a specific batch.
+    """
     with app.app_context():
         batch = db.session.get(Batch, batch_id)
         if not batch:
@@ -401,15 +477,12 @@ def export_batch_xlsx(batch_id):
         if not emails:
             return jsonify({"error": "No emails found in this batch to export"}), 404
 
-        # Create Workbook and Worksheet
         wb = Workbook(write_only=True)
         ws = wb.create_sheet(title=batch.batch_name)
 
-        # Write header row
         header = ["Email Address", "Source Domain", "Source URL", "Date Scraped"]
         ws.append(header)
 
-        # Write data rows
         for email in emails:
             row = [
                 email.email_address,
@@ -419,10 +492,8 @@ def export_batch_xlsx(batch_id):
             ]
             ws.append(row)
 
-        # Save the workbook to an in-memory file using the fixed helper function
         virtual_file = save_virtual_workbook(wb)
 
-        # Prepare the response
         file_data = BytesIO(virtual_file)
         filename = f"{batch.batch_name.replace(' ', '_')}_emails.xlsx"
 
@@ -435,8 +506,6 @@ def export_batch_xlsx(batch_id):
 
 
 if __name__ == '__main__':
-    # This is typically only used for local development
-    # On Render, Gunicorn runs the app using `gunicorn app:app`
     with app.app_context():
         db.create_all()
     app.run(host='0.0.0.0', port=os.environ.get('PORT', 5000))
