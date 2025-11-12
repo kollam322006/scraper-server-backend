@@ -16,6 +16,8 @@ from openpyxl import Workbook
 from urllib.parse import urlparse, urlunparse
 from flask_cors import CORS # Needed for front-end communication
 from io import BytesIO
+import requests 
+from bs4 import BeautifulSoup
 
 # --- FIX FOR OPENPYXL IMPORT ERROR ---
 # This function replaces the removed 'save_virtual_workbook'
@@ -526,3 +528,4 @@ if __name__ == '__main__':
     with app.app_context():
         db.create_all() 
     app.run(debug=True, port=5000)
+
