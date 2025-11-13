@@ -189,20 +189,16 @@ def scrape_task(batch_id: int, target_urls: List[tuple]):
     """
     Performs the background scraping task for a batch, with file extension and domain filtering.
     
-    CRITICAL FIX: This version removes the re-initialization of SQLAlchemy, relying on the 
-    globally imported 'db' object to prevent the RuntimeError. All database operations 
-    are correctly wrapped in app.app_context() to ensure a session is active in the worker.
+    FIX: This function now correctly relies on Batch, TargetURL, and Email being 
+    globally available in the module scope.
     """
     app.logger.info(f"Starting scrape task for Batch {batch_id} with {len(target_urls)} URLs.")
-    
-    # CRITICAL FIX: Removed the conflicting line 'db = SQLAlchemy(app)'. 
-    # This function now relies on the globally defined 'db' (SQLAlchemy instance) 
-    # being available and imported elsewhere in app.py.
     
     try:
         # 1. Initialize Batch Status
         with app.app_context():
             # Use db.session.get() which relies on the imported global 'db' instance
+            # CRITICAL: If 'Batch' is not defined here, it will fail.
             batch = db.session.get(Batch, batch_id) 
             if not batch:
                 app.logger.error(f"Batch with ID {batch_id} not found.")
@@ -220,6 +216,7 @@ def scrape_task(batch_id: int, target_urls: List[tuple]):
             app.logger.info(f"Worker processing URL ID {url_id}: {url_full}")
             
             with app.app_context():
+                # CRITICAL: If 'TargetURL' is not defined here, it will fail.
                 target_url_obj = db.session.get(TargetURL, url_id)
                 if not target_url_obj:
                     app.logger.error(f"TargetURL {url_id} not found.")
@@ -276,6 +273,7 @@ def scrape_task(batch_id: int, target_urls: List[tuple]):
                         if email_address not in unique_emails_in_batch:
                             
                             # Check database globally
+                            # CRITICAL: If 'Email' is not defined here, it will fail.
                             email_obj = db.session.scalar(
                                 select(Email).filter_by(address=email_address)
                             )
@@ -310,22 +308,25 @@ def scrape_task(batch_id: int, target_urls: List[tuple]):
                 app.logger.error(f"Request error for {url_full}: {e}")
                 with app.app_context():
                     target_url_obj = db.session.get(TargetURL, url_id)
-                    target_url_obj.status = "FAILED"
-                    target_url_obj.error_message = f"Request error: {str(e)[:250]}"
-                    db.session.commit()
+                    if target_url_obj:
+                        target_url_obj.status = "FAILED"
+                        target_url_obj.error_message = f"Request error: {str(e)[:250]}"
+                        db.session.commit()
             
             except Exception as e:
                 app.logger.error(f"General error during scraping {url_full}: {e}")
                 with app.app_context():
                     target_url_obj = db.session.get(TargetURL, url_id)
-                    target_url_obj.status = "FAILED"
-                    target_url_obj.error_message = f"Internal error: {str(e)[:250]}"
-                    db.session.commit()
+                    if target_url_obj:
+                        target_url_obj.status = "FAILED"
+                        target_url_obj.error_message = f"Internal error: {str(e)[:250]}"
+                        db.session.commit()
 
 
         # 4. Finalize Batch Status
         with app.app_context():
             # Check if all TargetURLs are COMPLETED or FAILED
+            # CRITICAL: If 'TargetURL' is not defined here, it will fail.
             pending_count = db.session.scalar(
                 select(func.count(TargetURL.id))
                 .filter(TargetURL.batch_id == batch_id)
@@ -349,6 +350,7 @@ def scrape_task(batch_id: int, target_urls: List[tuple]):
         app.logger.error(f"Unrecoverable error in scrape_task for batch {batch_id}: {e}")
         # Mark batch as FAILED if an exception was raised outside the inner loop
         with app.app_context():
+            # CRITICAL: If 'Batch' is not defined here, it will fail.
             batch = db.session.get(Batch, batch_id)
             if batch:
                 batch.status = "FAILED"
@@ -624,6 +626,7 @@ if __name__ == '__main__':
     with app.app_context():
         db.create_all() 
     app.run(debug=True, port=5000)
+
 
 
 
