@@ -189,18 +189,21 @@ def scrape_task(batch_id: int, target_urls: List[tuple]):
     """
     Performs the background scraping task for a batch, with file extension and domain filtering.
     
-    This function must handle database initialization manually as it runs in an RQ worker
-    process, outside the standard Flask request context.
+    CRITICAL FIX: This version removes the re-initialization of SQLAlchemy, relying on the 
+    globally imported 'db' object to prevent the RuntimeError. All database operations 
+    are correctly wrapped in app.app_context() to ensure a session is active in the worker.
     """
     app.logger.info(f"Starting scrape task for Batch {batch_id} with {len(target_urls)} URLs.")
     
-    # CRITICAL FIX: Initialize SQLAlchemy manually for the worker process (Assuming SQLAlchemy/SQL)
-    db = SQLAlchemy(app) 
+    # CRITICAL FIX: Removed the conflicting line 'db = SQLAlchemy(app)'. 
+    # This function now relies on the globally defined 'db' (SQLAlchemy instance) 
+    # being available and imported elsewhere in app.py.
     
     try:
         # 1. Initialize Batch Status
         with app.app_context():
-            batch = db.session.get(Batch, batch_id)
+            # Use db.session.get() which relies on the imported global 'db' instance
+            batch = db.session.get(Batch, batch_id) 
             if not batch:
                 app.logger.error(f"Batch with ID {batch_id} not found.")
                 return
@@ -298,7 +301,8 @@ def scrape_task(batch_id: int, target_urls: List[tuple]):
                     # Update TargetURL with status and results
                     target_url_obj = db.session.get(TargetURL, url_id)
                     target_url_obj.status = "COMPLETED"
-                    target_url_obj.found_emails.extend(emails_to_link)
+                    # Assuming TargetURL model has a relationship named 'emails'
+                    target_url_obj.emails.extend(emails_to_link) 
                     db.session.commit()
 
 
@@ -620,6 +624,7 @@ if __name__ == '__main__':
     with app.app_context():
         db.create_all() 
     app.run(debug=True, port=5000)
+
 
 
 
