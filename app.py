@@ -175,16 +175,7 @@ def sanitize_and_expand_urls(raw_urls_string):
     return final_urls
 
 # --- Scraper Task ---
-
-from datetime import datetime
-from typing import List
-import requests
-from bs4 import BeautifulSoup
-import re
-from sqlalchemy import select, func
-from flask_sqlalchemy import SQLAlchemy 
 # IMPORTANT: Assume 'app', 'Batch', 'TargetURL', and 'Email' models are defined elsewhere.
-
 # Define common file extensions to ignore globally
 FILE_EXTENSIONS = (
     '.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp', '.ico',
@@ -629,5 +620,6 @@ if __name__ == '__main__':
     with app.app_context():
         db.create_all() 
     app.run(debug=True, port=5000)
+
 
 
