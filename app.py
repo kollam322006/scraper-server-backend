@@ -1,181 +1,108 @@
 import os
-import redis
+import io
 import json
 import time
+import requests
 import re
-import io
-from flask import Flask, jsonify, request, send_file
-from flask_sqlalchemy import SQLAlchemy
-from rq import Queue
-from rq.job import Job
-from typing import List, Optional
+import logging
 from datetime import datetime
-from sqlalchemy.orm import Mapped, mapped_column, relationship
-from sqlalchemy import Integer, String, DateTime, Text, Boolean, func, distinct
-from openpyxl import Workbook
+from typing import List
 from urllib.parse import urlparse, urlunparse
-from flask_cors import CORS # Needed for front-end communication
-from io import BytesIO
-import requests 
+
 from bs4 import BeautifulSoup
 
-# --- FIX FOR OPENPYXL IMPORT ERROR ---
-# This function replaces the removed 'save_virtual_workbook'
-def save_virtual_workbook(workbook):
-    """
-    Saves an openpyxl Workbook to an in-memory BytesIO object.
-    """
-    virtual_file = io.BytesIO()
-    workbook.save(virtual_file)
-    virtual_file.seek(0) # Rewind the file to the beginning
-    return virtual_file.getvalue()
-# --- END FIX ---
+from flask import Flask, jsonify, request, send_file
+from flask_cors import CORS
+from flask_sqlalchemy import SQLAlchemy
+from sqlalchemy import select, func, or_
+from sqlalchemy.orm import relationship
 
+# RQ/Redis for background tasks
+import redis
+from rq import Queue
 
-# --- Database and Queue Configuration ---
+# XLSX library imports
+from openpyxl import Workbook
+from openpyxl.utils import get_column_letter
 
-# 1. Database Configuration
-DATABASE_URL = os.environ.get('DATABASE_URL')
+# --- 1. Configuration and Initialization ---
 
-# Standard URL correction (postgres -> postgresql)
-if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
-
-# CRITICAL FIX: Add sslmode=require for Render PostgreSQL connections 
-# This fixes the "SSL connection has been closed unexpectedly" error.
-if DATABASE_URL and 'sslmode=' not in DATABASE_URL:
-    if '?' in DATABASE_URL:
-        DATABASE_URL += '&sslmode=require'
-    else:
-        DATABASE_URL += '?sslmode=require'
-
-
-# 2. Redis Configuration
-REDIS_URL = os.environ.get('REDIS_URL', 'redis://localhost:6379/0')
-redis_conn = redis.from_url(REDIS_URL)
-
-# 3. Flask App Initialization
+# Set up logging for better debugging
+logging.basicConfig(level=logging.INFO)
 app = Flask(__name__)
-# Allow all origins for simplicity. For production, limit to your Netlify URL.
-CORS(app, resources={r"/*": {"origins": "*"}}) 
 
-app.config['SQLALCHEMY_DATABASE_URI'] = DATABASE_URL or 'sqlite:///scraper_data.db'
-app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+# Environment variables for configuration
+DB_URL = os.environ.get("DATABASE_URL", "sqlite:///scraper.db")
+# Use a separate URL for Redis, default to localhost for development
+REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379")
 
+# Flask and SQLAlchemy Configuration
+app.config["SQLALCHEMY_DATABASE_URI"] = DB_URL.replace("postgres://", "postgresql://", 1)
+app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "a_very_secret_key")
+
+# Initialize Extensions
 db = SQLAlchemy(app)
+CORS(app, resources={r"/*": {"origins": "*"}}) # Allow all origins
+
+# Initialize Redis and RQ Queue
+redis_conn = redis.from_url(REDIS_URL)
 q = Queue(connection=redis_conn)
 
-# --- Database Models ---
+# --- 2. SQLAlchemy Models ---
+
+# Association table for many-to-many relationship between TargetURL and Email
+url_email_association = db.Table(
+    "url_email_association",
+    db.Column("target_url_id", db.Integer, db.ForeignKey("target_url.id"), primary_key=True),
+    db.Column("email_id", db.Integer, db.ForeignKey("email.id"), primary_key=True),
+)
 
 class Batch(db.Model):
-    __tablename__ = 'batches'
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    name: Mapped[str] = mapped_column(String(255), nullable=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-    status: Mapped[str] = mapped_column(String(50), default='PENDING')
-    job_id: Mapped[str] = mapped_column(String(50), nullable=True)
+    __tablename__ = 'batch'
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(255), nullable=True)
+    job_id = db.Column(db.String(36), unique=True, nullable=True) # RQ Job ID
+    status = db.Column(db.String(50), default="PENDING")
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    start_time = db.Column(db.DateTime, nullable=True)
+    end_time = db.Column(db.DateTime, nullable=True)
 
-    # CRITICAL FIX: cascade="all, delete-orphan" to fix Foreign Key Violation
-    emails: Mapped[List["Email"]] = relationship("Email", back_populates="batch", cascade="all, delete-orphan")
+    target_urls = relationship("TargetURL", backref="batch", lazy=True, cascade="all, delete-orphan")
     
-    # Tracking for progress
-    domains_to_scrape: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    total_domains: Mapped[int] = mapped_column(Integer, default=0)
-    domains_processed: Mapped[int] = mapped_column(Integer, default=0)
-    
-    def __repr__(self):
-        return f"<Batch {self.id}: {self.name}>"
-
-    def to_dict(self):
-        return {
-            'id': self.id,
-            'name': self.name,
-            'status': self.status,
-            'job_id': self.job_id,
-            'created_at': self.created_at.isoformat(),
-            'domains_processed': self.domains_processed,
-            'total_domains': self.total_domains,
-            'email_count': db.session.scalar(db.select(func.count(Email.id)).filter_by(batch_id=self.id))
-        }
-
-class Email(db.Model):
-    __tablename__ = 'emails'
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    batch_id: Mapped[int] = mapped_column(Integer, db.ForeignKey('batches.id'), nullable=False)
-    email_address: Mapped[str] = mapped_column(String(255), nullable=False)
-    source_url: Mapped[str] = mapped_column(String(500), nullable=False) 
-    source_domain: Mapped[str] = mapped_column(String(255), nullable=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-
-    batch: Mapped["Batch"] = relationship("Batch", back_populates="emails")
-
-    __table_args__ = (
-        # Unique constraint per batch: ensures one email is saved only once *per batch*
-        db.UniqueConstraint('batch_id', 'email_address', 'source_url', name='uix_email_batch_source'), 
+    # Relationship to find all unique emails associated with this batch
+    emails = relationship(
+        "Email", 
+        secondary=url_email_association, 
+        primaryjoin=lambda: Batch.id == TargetURL.batch_id,
+        secondaryjoin=lambda: TargetURL.id == url_email_association.c.target_url_id,
+        overlaps="target_urls,emails",
+        viewonly=True 
     )
 
-    def to_dict(self):
-        return {
-            'id': self.id,
-            'batch_id': self.batch_id,
-            'email_address': self.email_address,
-            'source_url': self.source_url,
-            'source_domain': self.source_domain,
-            'created_at': self.created_at.isoformat()
-        }
 
-# --- Scraper Task Helper Functions ---
+class TargetURL(db.Model):
+    __tablename__ = 'target_url'
+    id = db.Column(db.Integer, primary_key=True)
+    url = db.Column(db.Text, nullable=False)
+    domain = db.Column(db.String(255), nullable=False)
+    status = db.Column(db.String(50), default="PENDING") # PENDING, IN_PROGRESS, COMPLETED, FAILED
+    error_message = db.Column(db.Text, nullable=True)
+    batch_id = db.Column(db.Integer, db.ForeignKey("batch.id"), nullable=False)
 
-def sanitize_and_expand_urls(raw_urls_string):
-    """
-    Takes a raw string of domains/URLs, sanitizes them, and expands each domain 
-    into a list of target URLs for scraping.
-    Returns a list of tuples: (url_to_scrape, base_domain_url_to_save, domain_to_save)
-    """
-    # Define the 3 paths to check for each domain
-    TARGET_SUFFIXES = [
-        "", # For the original link / homepage
-        "/policies/privacy-policy",
-        "/policies/contact-information"
-    ]
-    
-    urls_to_scrape_and_save_as = [] 
-    raw_links = [u.strip() for u in raw_urls_string.split('\n') if u.strip()]
+    emails = relationship("Email", secondary=url_email_association, backref="target_urls", lazy=True, cascade="save-update")
 
-    for link in raw_links:
-        try:
-            if '://' not in link:
-                link = 'https://' + link
 
-            parsed_url = urlparse(link)
-            
-            # Sanitize the network location (netloc) to remove 'www.'
-            netloc = parsed_url.netloc.replace('www.', '')
-            scheme = 'https' # Force HTTPS
-            
-            # This is the Base URL we will save emails against
-            base_url_parts = (scheme, netloc, '', '', '', '')
-            base_domain_url = urlunparse(base_url_parts)
-            domain_to_save = netloc
-            
-            # Expand into target URLs (3 total)
-            for suffix in TARGET_SUFFIXES:
-                target_url_parts = (scheme, netloc, suffix, '', '', '')
-                url_to_scrape = urlunparse(target_url_parts)
-                
-                # Append the tuple: (URL to fetch, Base URL for saving, Base Domain for saving)
-                urls_to_scrape_and_save_as.append((url_to_scrape, base_domain_url, domain_to_save))
+class Email(db.Model):
+    __tablename__ = 'email'
+    id = db.Column(db.Integer, primary_key=True)
+    address = db.Column(db.String(255), unique=True, nullable=False, index=True)
+    domain = db.Column(db.String(255), nullable=False, index=True)
+    # The ID of the batch where this email was first discovered
+    first_found_batch_id = db.Column(db.Integer, db.ForeignKey('batch.id'), nullable=True) 
 
-        except Exception as e:
-            print(f"[ERROR] Skipping invalid URL: {link}. Error: {e}")
-            continue
+# --- 3. Utility Functions for Scraping (Run by RQ Worker) ---
 
-    final_urls = list(set(urls_to_scrape_and_save_as))
-    print(f"[DEBUG] Generated {len(final_urls)} target URLs from {len(raw_links)} raw inputs.")
-    return final_urls
-
-# --- Scraper Task ---
-# IMPORTANT: Assume 'app', 'Batch', 'TargetURL', and 'Email' models are defined elsewhere.
 # Define common file extensions to ignore globally
 FILE_EXTENSIONS = (
     '.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp', '.ico',
@@ -185,20 +112,89 @@ FILE_EXTENSIONS = (
     '.exe', '.dll', '.tif', '.tiff', '.bmp', '.mpv', '.mov', '.flv'
 )
 
+def normalize_url(url: str) -> str:
+    """Ensures the URL has a scheme (defaulting to https) and is cleaned."""
+    if not url.startswith(('http://', 'https://')):
+        url = 'https://' + url
+    parsed = urlparse(url)
+    # Ensure netloc is present and domain is lowercase
+    if not parsed.netloc:
+        return ""
+    
+    # Keep only scheme, netloc, and path
+    return urlunparse(parsed._replace(params='', query='', fragment=''))
+
+def extract_domain(url: str) -> str:
+    """Extracts the root domain from a full URL."""
+    try:
+        parsed_uri = urlparse(url)
+        domain = '{uri.netloc}'.format(uri=parsed_uri)
+        # Handle cases where domain starts with 'www.'
+        if domain.startswith('www.'):
+            domain = domain[4:]
+        return domain.lower()
+    except Exception:
+        return ""
+
+def generate_target_urls(raw_inputs: List[str]) -> List[tuple]:
+    """
+    Takes raw domain/URL inputs and generates normalized, target URLs 
+    (contact, about, privacy, etc.)
+    Returns a list of tuples: (normalized_url, domain)
+    """
+    base_urls = []
+    
+    # 1. Normalize all inputs to root domains or full URLs
+    for input_str in raw_inputs:
+        input_str = input_str.strip()
+        if not input_str:
+            continue
+        
+        normalized = normalize_url(input_str)
+        if normalized:
+            base_urls.append(normalized)
+
+    # 2. Generate policy page URLs
+    target_pages = set()
+    suffixes = [
+        "contact", "contact-us", "about", "about-us", 
+        "policies/privacy-policy", "policies/contact-information"
+    ]
+    
+    for base_url in base_urls:
+        domain = extract_domain(base_url)
+        if not domain:
+            continue
+
+        # If input was a domain/root, generate all policy URLs
+        is_root = (base_url == f"https://{domain}" or base_url == f"https://www.{domain}")
+        
+        if is_root:
+            for suffix in suffixes:
+                # Add / before suffix if needed, but not common in policy pages
+                page_url = f"{base_url.rstrip('/')}/{suffix.lstrip('/')}"
+                target_pages.add((page_url, domain))
+        else:
+            # If input was a specific policy page, just add that one
+            target_pages.add((base_url, domain))
+
+    app.logger.debug(f"Generated {len(target_pages)} target URLs from {len(raw_inputs)} raw inputs.")
+    return list(target_pages)
+
+
 def scrape_task(batch_id: int, target_urls: List[tuple]):
     """
-    Performs the background scraping task for a batch, with file extension and domain filtering.
+    Performs the background scraping task for a batch.
     
-    FIX: This function now correctly relies on Batch, TargetURL, and Email being 
-    globally available in the module scope.
+    FIX 1: Removed redundant SQLAlchemy initialization.
+    FIX 2: Relies on Batch, TargetURL, and Email models being globally available.
     """
     app.logger.info(f"Starting scrape task for Batch {batch_id} with {len(target_urls)} URLs.")
     
     try:
         # 1. Initialize Batch Status
         with app.app_context():
-            # Use db.session.get() which relies on the imported global 'db' instance
-            # CRITICAL: If 'Batch' is not defined here, it will fail.
+            # Accessing model classes (Batch, TargetURL, Email) from the module scope
             batch = db.session.get(Batch, batch_id) 
             if not batch:
                 app.logger.error(f"Batch with ID {batch_id} not found.")
@@ -216,7 +212,6 @@ def scrape_task(batch_id: int, target_urls: List[tuple]):
             app.logger.info(f"Worker processing URL ID {url_id}: {url_full}")
             
             with app.app_context():
-                # CRITICAL: If 'TargetURL' is not defined here, it will fail.
                 target_url_obj = db.session.get(TargetURL, url_id)
                 if not target_url_obj:
                     app.logger.error(f"TargetURL {url_id} not found.")
@@ -273,7 +268,6 @@ def scrape_task(batch_id: int, target_urls: List[tuple]):
                         if email_address not in unique_emails_in_batch:
                             
                             # Check database globally
-                            # CRITICAL: If 'Email' is not defined here, it will fail.
                             email_obj = db.session.scalar(
                                 select(Email).filter_by(address=email_address)
                             )
@@ -299,7 +293,6 @@ def scrape_task(batch_id: int, target_urls: List[tuple]):
                     # Update TargetURL with status and results
                     target_url_obj = db.session.get(TargetURL, url_id)
                     target_url_obj.status = "COMPLETED"
-                    # Assuming TargetURL model has a relationship named 'emails'
                     target_url_obj.emails.extend(emails_to_link) 
                     db.session.commit()
 
@@ -326,7 +319,6 @@ def scrape_task(batch_id: int, target_urls: List[tuple]):
         # 4. Finalize Batch Status
         with app.app_context():
             # Check if all TargetURLs are COMPLETED or FAILED
-            # CRITICAL: If 'TargetURL' is not defined here, it will fail.
             pending_count = db.session.scalar(
                 select(func.count(TargetURL.id))
                 .filter(TargetURL.batch_id == batch_id)
@@ -340,7 +332,6 @@ def scrape_task(batch_id: int, target_urls: List[tuple]):
                 batch.status = "COMPLETED"
                 app.logger.info(f"Batch {batch_id} finished successfully.")
             else:
-                # If any are still IN_PROGRESS (shouldn't happen if error handling is perfect)
                 batch.status = "FAILED" 
                 app.logger.error(f"Batch {batch_id} finished with {pending_count} pending URLs.")
 
@@ -350,284 +341,291 @@ def scrape_task(batch_id: int, target_urls: List[tuple]):
         app.logger.error(f"Unrecoverable error in scrape_task for batch {batch_id}: {e}")
         # Mark batch as FAILED if an exception was raised outside the inner loop
         with app.app_context():
-            # CRITICAL: If 'Batch' is not defined here, it will fail.
             batch = db.session.get(Batch, batch_id)
             if batch:
                 batch.status = "FAILED"
                 db.session.commit()
 
-# --- API Endpoints ---
 
-@app.route('/create_tables', methods=['POST'])
-def create_tables_endpoint():
-    """Utility endpoint to manually create database tables."""
+# --- 4. API Routes ---
+
+@app.route("/create_tables", methods=["POST"])
+def create_tables():
+    """Endpoint to ensure database tables are created."""
     with app.app_context():
-        db.create_all()
-    return jsonify({"message": "Tables created or already exist."}), 201
+        # Check for existing tables by querying a model
+        try:
+            db.session.execute(select(Batch).limit(1))
+            db_exists = True
+        except Exception:
+            db_exists = False
 
-@app.route('/start_batch_scrape', methods=['POST'])
+        if not db_exists:
+            db.create_all()
+            return jsonify({"message": "Tables created."}), 201
+        
+        return jsonify({"message": "Tables created or already exist."}), 200
+
+
+@app.route("/start_batch_scrape", methods=["OPTIONS", "POST"])
 def start_batch_scrape():
-    """Starts a new background scraping job."""
-    data = request.json
-    urls_input = data.get('urls', '')
-    batch_name = data.get('batch_name', f'Batch {datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")}')
+    """Initiates a new scraping batch."""
+    if request.method == "OPTIONS":
+        return "", 200
 
-    if not urls_input:
-        return jsonify({"error": "No URLs provided"}), 400
+    data = request.get_json()
+    raw_inputs = data.get("domains", "").split("\n")
+    batch_name = data.get("name", f"Batch {datetime.now().strftime('%m/%d/%Y, %I:%M:%S %p')}")
 
-    # 1. Sanitize and expand URLs
-    urls_to_process = sanitize_and_expand_urls(urls_input)
-    if not urls_to_process:
-        return jsonify({"error": "No valid URLs could be processed"}), 400
+    if not raw_inputs or all(not i.strip() for i in raw_inputs):
+        return jsonify({"error": "No domains or URLs provided."}), 400
+
+    target_urls_data = generate_target_urls(raw_inputs)
     
+    if not target_urls_data:
+        return jsonify({"error": "Could not generate valid URLs from input."}), 400
+
     with app.app_context():
-        # 2. Create a new Batch record
-        new_batch = Batch(
-            name=batch_name, 
-            status='PENDING',
-            domains_to_scrape=json.dumps([url[1] for url in urls_to_process]), # Store base domains
-            total_domains=len(urls_to_process) # Total URLs to scrape
-        )
+        # 1. Create Batch record
+        new_batch = Batch(name=batch_name, status="PENDING")
         db.session.add(new_batch)
+        db.session.flush() # Get the batch ID before commit
+
+        # 2. Create TargetURL records
+        target_url_tuples = []
+        for url, domain in target_urls_data:
+            target_url = TargetURL(url=url, domain=domain, batch_id=new_batch.id)
+            db.session.add(target_url)
+            db.session.flush() # Get the URL ID before commit
+            # Store (id, full_url, domain) for the worker task
+            target_url_tuples.append((target_url.id, url, domain))
+
         db.session.commit()
-        batch_id = new_batch.id
-        
-        # 3. Enqueue the scraping task
-        job = q.enqueue(scrape_task, batch_id, urls_to_process, job_timeout='1h') 
-        
+
+        # 3. Enqueue job
+        # RQ only takes simple types, so we pass the TargetURL data needed for the worker
+        job = q.enqueue(scrape_task, new_batch.id, target_url_tuples, job_timeout='3h')
         new_batch.job_id = job.id
         db.session.commit()
 
-        return jsonify({
-            "message": "Scraping job queued",
-            "batch_id": batch_id,
-            "job_id": job.id,
-            "status": "QUEUED"
-        }), 202
+    return jsonify({
+        "message": "Scraping job started",
+        "batch_id": new_batch.id,
+        "job_id": job.id,
+        "total_urls": len(target_url_tuples)
+    }), 202
 
-@app.route('/status/<job_id>', methods=['GET'])
+
+@app.route("/status/<job_id>", methods=["GET"])
 def get_job_status(job_id):
-    """Retrieves the live status of an RQ job from the database."""
-    with app.app_context():
-        batch = db.session.execute(db.select(Batch).filter_by(job_id=job_id)).scalar_one_or_none()
+    """Retrieves the status of an RQ job."""
+    try:
+        job = q.fetch_job(job_id)
+        if job is None:
+            # If the job is missing from RQ, check DB for final status
+            with app.app_context():
+                batch = db.session.scalar(select(Batch).filter_by(job_id=job_id))
+                if batch:
+                    return jsonify({"job_id": job_id, "status": batch.status, "progress": 100})
+            
+            return jsonify({"error": "Job not found"}), 404
         
-        if not batch:
-            # Check RQ job status as a fallback
-            try:
-                job = Job.fetch(job_id, connection=redis_conn)
-                rq_status = job.get_status()
-                return jsonify({"status": rq_status.upper(), "progress_percent": 0, "result": "Job found in queue but not in DB."}), 200
-            except:
-                 return jsonify({"status": "NOT_FOUND", "progress_percent": 0, "result": "Job not found."}), 404
+        # Calculate progress based on DB records (more accurate than RQ metadata)
+        with app.app_context():
+            batch = db.session.scalar(select(Batch).filter_by(job_id=job_id))
+            if not batch:
+                return jsonify({"job_id": job_id, "status": job.get_status(), "progress": 0}), 200
 
-        # Job found in DB, report its status
-        total_domains = batch.total_domains
-        domains_processed = batch.domains_processed
-        progress_percent = int((domains_processed / total_domains) * 100) if total_domains > 0 else 0
-        db_status = batch.status.upper()
-        
-        result_text = "Processing..."
-        if db_status == 'COMPLETED':
-            job = Job.fetch(job_id, connection=redis_conn)
-            result_text = job.result if job.result else "Batch scrape finished."
-        elif db_status == 'FAILED':
-            result_text = "Job failed during processing."
-
-        return jsonify({
-            "status": db_status,
-            "progress_percent": progress_percent,
-            "domains_processed": domains_processed,
-            "total_domains": total_domains,
-            "result": result_text
-        }), 200
-
-@app.route('/batches', methods=['GET'])
-def get_batches():
-    """Returns a list of all saved batches."""
-    with app.app_context():
-        batches = db.session.execute(
-            db.select(Batch).order_by(Batch.created_at.desc())
-        ).scalars().all()
-        
-        return jsonify([b.to_dict() for b in batches]), 200
-
-@app.route('/batches/<int:batch_id>/emails', methods=['GET'])
-def get_batch_emails(batch_id):
-    """Returns emails for a specific batch, optionally filtered by query string."""
-    search_query = request.args.get('q')
-    
-    with app.app_context():
-        batch = db.session.get(Batch, batch_id)
-        if not batch:
-            return jsonify({"error": "Batch not found"}), 404
-
-        query = db.select(Email).filter_by(batch_id=batch_id).order_by(Email.email_address)
-
-        if search_query:
-            search_pattern = f"%{search_query}%"
-            query = query.filter(
-                db.or_(
-                    Email.email_address.ilike(search_pattern), 
-                    Email.source_domain.ilike(search_pattern)
-                )
+            total_urls = db.session.scalar(select(func.count(TargetURL.id)).filter_by(batch_id=batch.id))
+            processed_urls = db.session.scalar(
+                select(func.count(TargetURL.id))
+                .filter(TargetURL.batch_id == batch.id)
+                .filter(or_(
+                    TargetURL.status == "COMPLETED",
+                    TargetURL.status == "FAILED"
+                ))
             )
-
-        emails = db.session.execute(query).scalars().all()
-        
-        return jsonify([e.to_dict() for e in emails]), 200
-
-@app.route('/batches/<int:batch_id>', methods=['PATCH'])
-def rename_batch(batch_id):
-    """[RENAMING BATCHES] Updates the name of a specific batch."""
-    data = request.json
-    new_name = data.get('batch_name')
-
-    if not new_name:
-        return jsonify({"error": "Batch name is required"}), 400
-
-    with app.app_context():
-        batch = db.session.get(Batch, batch_id)
-        if not batch:
-            return jsonify({"error": "Batch not found"}), 404
-        
-        batch.name = new_name
-        db.session.commit()
-        
-        return jsonify({"message": f"Batch {batch_id} renamed successfully", "new_name": new_name}), 200
-
-@app.route('/emails/<int:email_id>', methods=['PATCH'])
-def update_email(email_id):
-    """[EDITING EMAILS] Updates the address and/or source domain of a specific email."""
-    data = request.json
-    new_address = data.get('email_address')
-    new_domain = data.get('source_domain')
-
-    if not new_address and not new_domain:
-        return jsonify({"error": "No fields provided for update (email_address or source_domain)"}), 400
-
-    with app.app_context():
-        email = db.session.get(Email, email_id)
-        if not email:
-            return jsonify({"error": "Email not found"}), 404
-        
-        if new_address:
-            email.email_address = new_address
-        if new_domain:
-            email.source_domain = new_domain
-        
-        db.session.commit()
-        return jsonify(email.to_dict()), 200
-
-
-@app.route('/emails/delete', methods=['DELETE'])
-def delete_emails():
-    """[DELETING SELECTED EMAILS] Deletes selected individual emails by a list of IDs."""
-    data = request.json
-    ids_to_delete = data.get('ids', [])
-
-    if not ids_to_delete or not isinstance(ids_to_delete, list):
-        return jsonify({"error": "A list of email IDs is required"}), 400
-
-    try:
-        with app.app_context():
-            deleted_count = db.session.query(Email).filter(Email.id.in_(ids_to_delete)).delete(synchronize_session='fetch')
-            db.session.commit()
+            
+            progress = (processed_urls / total_urls) * 100 if total_urls else 0
             
             return jsonify({
-                "message": f"Successfully deleted {deleted_count} email(s)",
-                "deleted_count": deleted_count
+                "job_id": job_id, 
+                "status": batch.status, 
+                "progress": round(progress),
+                "processed_count": processed_urls,
+                "total_count": total_urls
             }), 200
 
     except Exception as e:
-        db.session.rollback()
-        print(f"Error deleting emails: {e}")
-        return jsonify({"error": f"Failed to delete emails: {e}"}), 500
+        app.logger.error(f"Error fetching job status: {e}")
+        return jsonify({"error": "Failed to retrieve job status."}), 500
 
-@app.route('/batches/delete', methods=['DELETE'])
-def delete_batches():
-    """[DELETING BATCHES] Deletes batches by a list of IDs and all associated emails."""
-    data = request.json
-    ids_to_delete = data.get('ids', [])
 
-    if not ids_to_delete or not isinstance(ids_to_delete, list):
-        return jsonify({"error": "A list of batch IDs is required"}), 400
-    
-    try:
-        with app.app_context():
-            batches_to_delete = db.session.query(Batch).filter(Batch.id.in_(ids_to_delete)).all()
-            
-            deleted_ids = []
-            for batch in batches_to_delete:
-                deleted_ids.append(batch.id)
-                db.session.delete(batch)
-            
-            # The 'cascade="all, delete-orphan"' rule handles deleting the 'Email' records.
-            db.session.commit()
-
-            return jsonify({
-                "message": f"Successfully deleted {len(deleted_ids)} batch(es).",
-                "deleted_ids": deleted_ids
-            }), 200
-
-    except Exception as e:
-        db.session.rollback()
-        print(f"Error deleting batches: {e}")
-        return jsonify({"error": f"Failed to delete batches: {e.__class__.__name__}."}), 500
-
-@app.route('/batches/export/xlsx/<int:batch_id>', methods=['GET'])
-def export_batch_xlsx(batch_id):
-    """[EXPORTING XLSX] Generates and returns an XLSX file for a specific batch."""
-    from io import BytesIO 
-    
+@app.route("/batches", methods=["GET"])
+def get_batches():
+    """Retrieves a list of all existing batches."""
     with app.app_context():
-        batch = db.session.get(Batch, batch_id)
-        if not batch:
-            return jsonify({"error": "Batch not found"}), 404
+        batches = db.session.scalars(select(Batch).order_by(Batch.created_at.desc())).all()
+        
+        batch_list = []
+        for batch in batches:
+            email_count = db.session.scalar(
+                select(func.count(Email.id))
+                .join(url_email_association)
+                .join(TargetURL)
+                .filter(TargetURL.batch_id == batch.id)
+                .group_by(Email.id) # Count unique emails
+            )
+            
+            batch_list.append({
+                "id": batch.id,
+                "name": batch.name,
+                "status": batch.status,
+                "job_id": batch.job_id,
+                "created_at": batch.created_at.isoformat(),
+                "emails_count": email_count if email_count is not None else 0
+            })
+        return jsonify(batch_list), 200
 
-        emails = db.session.execute(
-            db.select(Email).filter_by(batch_id=batch_id).order_by(Email.email_address)
-        ).scalars().all()
 
+@app.route("/batches/<int:batch_id>/emails", methods=["GET"])
+def get_batch_emails(batch_id):
+    """Retrieves all unique emails associated with a specific batch."""
+    with app.app_context():
+        # Query unique emails that are associated with any TargetURL belonging to this batch
+        emails_query = select(Email).distinct().join(Email.target_urls).filter(TargetURL.batch_id == batch_id)
+        emails = db.session.scalars(emails_query).all()
+
+        emails_list = [
+            {
+                "id": email.id,
+                "address": email.address,
+                "domain": email.domain,
+                "source_urls": [url.url for url in email.target_urls if url.batch_id == batch_id]
+            }
+            for email in emails
+        ]
+        return jsonify(emails_list), 200
+
+@app.route("/batches/<int:batch_id>/urls", methods=["GET"])
+def get_batch_urls(batch_id):
+    """Retrieves all target URLs for a batch and their statuses."""
+    with app.app_context():
+        urls = db.session.scalars(select(TargetURL).filter_by(batch_id=batch_id)).all()
+        url_list = [{
+            "id": url.id,
+            "url": url.url,
+            "status": url.status,
+            "error_message": url.error_message,
+            "emails_found": len(url.emails)
+        } for url in urls]
+        return jsonify(url_list), 200
+
+
+@app.route("/batches/<int:batch_id>/export_xlsx", methods=["GET"])
+def export_xlsx(batch_id):
+    """Generates and serves an Excel file for the unique emails in a batch."""
+    with app.app_context():
+        emails_query = select(Email).distinct().join(Email.target_urls).filter(TargetURL.batch_id == batch_id)
+        emails = db.session.scalars(emails_query).all()
+        
+        if not emails:
+            return jsonify({"message": "No emails found for this batch."}), 404
+
+        # Create a new workbook and select the active sheet
         wb = Workbook()
         ws = wb.active
-        ws.title = f"Batch_{batch_id}_Emails"
+        ws.title = "Extracted Emails"
 
-        headers = ["Email Address", "Source URL", "Source Domain"]
+        # Headers
+        headers = ["Email Address", "Domain", "Source URLs in Batch"]
         ws.append(headers)
 
-        seen_emails = set()
+        # Data rows
         for email in emails:
-            # Simple de-duplication for the export
-            if email.email_address not in seen_emails:
-                ws.append([
-                    email.email_address,
-                    email.source_url,
-                    email.source_domain
-                ])
-                seen_emails.add(email.email_address)
+            # Filter source URLs to only include those associated with the current batch
+            source_urls = [
+                url.url for url in email.target_urls 
+                if url.batch_id == batch_id
+            ]
+            ws.append([
+                email.address,
+                email.domain,
+                ", ".join(source_urls) 
+            ])
 
-        output = BytesIO()
+        # Adjust column widths
+        for col in range(1, len(headers) + 1):
+            ws.column_dimensions[get_column_letter(col)].width = 30
+
+        # Save to a virtual file
+        output = io.BytesIO()
         wb.save(output)
         output.seek(0)
-
-        download_name = f"{batch.name.replace(' ', '_').replace('/', '')}_Export_{datetime.utcnow().strftime('%Y%m%d')}.xlsx"
         
+        batch = db.session.get(Batch, batch_id)
+        filename = f"emails_batch_{batch_id}_{batch.name.replace(' ', '_')}.xlsx"
+
         return send_file(
-            output,
+            output, 
             mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
             as_attachment=True,
-            download_name=download_name
+            download_name=filename
         )
 
 
-if __name__ == '__main__':
-    # This block is for local development only.
-    # On Render, Gunicorn runs 'app:app'
+@app.route("/batches/delete", methods=["OPTIONS", "DELETE"])
+def delete_batches():
+    """Deletes batches and their related records."""
+    if request.method == "OPTIONS":
+        return "", 200
+        
+    data = request.get_json()
+    batch_ids = data.get("batch_ids", [])
+    
+    if not batch_ids:
+        return jsonify({"message": "No batch IDs provided."}), 400
+
     with app.app_context():
-        db.create_all() 
-    app.run(debug=True, port=5000)
+        try:
+            # 1. Delete TargetURL records associated with the batches
+            # SQLAlchemy's cascade on TargetURL should handle the association table entries
+            target_urls_to_delete = db.session.scalars(
+                select(TargetURL).filter(TargetURL.batch_id.in_(batch_ids))
+            ).all()
+            for url in target_urls_to_delete:
+                db.session.delete(url)
+            
+            # 2. Delete the Batch records
+            batches_to_delete = db.session.scalars(
+                select(Batch).filter(Batch.id.in_(batch_ids))
+            ).all()
+            
+            deleted_count = len(batches_to_delete)
+            for batch in batches_to_delete:
+                db.session.delete(batch)
+            
+            db.session.commit()
+            
+            return jsonify({"message": f"Successfully deleted {deleted_count} batches and their related data."}), 200
+        
+        except Exception as e:
+            db.session.rollback()
+            app.logger.error(f"Failed to delete batches: {e}")
+            return jsonify({"error": f"Failed to delete batches: {str(e)}"}), 500
 
 
+# --- 5. App Runner ---
 
-
-
+if __name__ == "__main__":
+    # Create tables on application start (can be moved to a separate init script)
+    with app.app_context():
+        db.create_all()
+    
+    # In a production environment like Render, you typically use gunicorn/waitress to run the app.
+    # For local testing:
+    # app.run(debug=True)
+    
+    # Running this script directly will only start the Flask web server.
+    # The RQ worker process must be started separately (e.g., using a separate `rq worker` command).
+    app.run(host='0.0.0.0', port=os.environ.get('PORT', 5000))
