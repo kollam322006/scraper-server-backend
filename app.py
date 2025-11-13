@@ -176,115 +176,188 @@ def sanitize_and_expand_urls(raw_urls_string):
 
 # --- Scraper Task ---
 
+from datetime import datetime
+from typing import List
+import requests
+from bs4 import BeautifulSoup
+import re
+from sqlalchemy import select, func
+from flask_sqlalchemy import SQLAlchemy 
+# IMPORTANT: Assume 'app', 'Batch', 'TargetURL', and 'Email' models are defined elsewhere.
+
+# Define common file extensions to ignore globally
+FILE_EXTENSIONS = (
+    '.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp', '.ico',
+    '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx',
+    '.zip', '.rar', '.7z', '.mp4', '.avi', '.mov', '.mp3', '.wav',
+    '.js', '.css', '.xml', '.json', '.txt', '.php', '.asp', '.html',
+    '.exe', '.dll', '.tif', '.tiff', '.bmp', '.mpv', '.mov', '.flv'
+)
+
 def scrape_task(batch_id: int, target_urls: List[tuple]):
     """
-    Performs the background scraping task for a batch, with improved email filtering.
-
-    Args:
-        batch_id: The ID of the batch being processed.
-        target_urls: A list of tuples (url_to_scrape, original_domain)
+    Performs the background scraping task for a batch, with file extension and domain filtering.
+    
+    This function must handle database initialization manually as it runs in an RQ worker
+    process, outside the standard Flask request context.
     """
     app.logger.info(f"Starting scrape task for Batch {batch_id} with {len(target_urls)} URLs.")
-    # Reinitialize DB connection for worker (using the provided SQLAlchemy session helper)
-    db = get_firestore_db(app) 
-
+    
+    # CRITICAL FIX: Initialize SQLAlchemy manually for the worker process (Assuming SQLAlchemy/SQL)
+    db = SQLAlchemy(app) 
+    
     try:
-        # 1. Define common file extensions to ignore
-        # These patterns often mimic email structure but are actually file paths.
-        FILE_EXTENSIONS = (
-            '.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp', '.ico',
-            '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx',
-            '.zip', '.rar', '.7z', '.mp4', '.avi', '.mov', '.mp3', '.wav',
-            '.js', '.css', '.xml', '.json', '.txt', '.php', '.asp', '.html'
-        )
-        
-        # 2. Update the general email regex
-        EMAIL_REGEX = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,63}'
-        
-        # Keep track of found emails (lower case) to avoid duplicates
-        found_emails = set()
-        
-        for i, (url_to_scrape, original_domain) in enumerate(target_urls):
-            app.logger.info(f"Processing Batch {batch_id}: URL {i+1}/{len(target_urls)}: {url_to_scrape}")
+        # 1. Initialize Batch Status
+        with app.app_context():
+            batch = db.session.get(Batch, batch_id)
+            if not batch:
+                app.logger.error(f"Batch with ID {batch_id} not found.")
+                return
+
+            batch.status = "IN_PROGRESS"
+            batch.start_time = datetime.now()
+            db.session.commit()
+
+        # 2. Iterate and scrape
+        # Tracks unique emails found in this batch (address -> Email Object)
+        unique_emails_in_batch = {} 
+
+        for url_id, url_full, url_domain in target_urls:
+            app.logger.info(f"Worker processing URL ID {url_id}: {url_full}")
             
-            # --- START SCRAPING LOGIC ---
+            with app.app_context():
+                target_url_obj = db.session.get(TargetURL, url_id)
+                if not target_url_obj:
+                    app.logger.error(f"TargetURL {url_id} not found.")
+                    continue
+                
+                target_url_obj.status = "IN_PROGRESS"
+                db.session.commit()
             
             try:
-                # Use a common user agent to avoid being blocked
+                # --- Fetching and Parsing ---
                 headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
-                # Fetch the content with a timeout
-                response = requests.get(url_to_scrape, timeout=15, headers=headers)
-                response.raise_for_status()  # Raise HTTPError for bad responses (4xx or 5xx)
+                response = requests.get(url_full, headers=headers, timeout=15)
+                response.raise_for_status() 
+                page_content = response.text
                 
-                soup = BeautifulSoup(response.text, 'html.parser')
-                # Search both text and raw HTML (sometimes emails are in script tags/comments)
-                text_content = soup.get_text() + response.text 
+                # --- Email Extraction and Filtering ---
+                # Regex for potential emails
+                potential_emails = set(re.findall(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', page_content))
+                
+                def get_email_domain(email):
+                    return email.split('@')[-1]
 
-                # 3. Find all potential emails
-                potential_emails = re.findall(EMAIL_REGEX, text_content, re.IGNORECASE)
+                common_info_prefixes = ["info", "contact", "support", "sales"]
+                expected_domain = url_domain.lower()
+
+                filtered_emails = set()
                 
-                # 4. Filter the emails
-                new_emails_found_in_url = 0
                 for email in potential_emails:
                     email_lower = email.lower()
+                    email_domain = get_email_domain(email_lower)
+                    email_prefix = email_lower.split('@')[0].lower()
                     
-                    # Check if the email ends with a known file extension
-                    is_file_extension = False
-                    for ext in FILE_EXTENSIONS:
-                        if email_lower.endswith(ext):
-                            is_file_extension = True
-                            break
-                            
-                    # Only add the email if it is NOT a file extension and is NEW
-                    if not is_file_extension and email_lower not in found_emails:
-                        found_emails.add(email_lower)
-                        new_emails_found_in_url += 1
-                        
-                        # Add email to the database
-                        new_email = Email(
-                            email_address=email_lower,
-                            source_url=url_to_scrape,
-                            domain=original_domain,
-                            batch_id=batch_id
-                        )
-                        db.session.add(new_email)
-                        
-                # Update progress after each URL
-                Batch.query.filter_by(id=batch_id).update({
-                    'domains_processed': i + 1,
-                    # We only commit the DB session once for batch and new emails together
-                })
-                db.session.commit()
-                
-            except requests.exceptions.HTTPError as e:
-                app.logger.warning(f"Batch {batch_id}: HTTP Error for {url_to_scrape}: {e}")
-            except requests.exceptions.RequestException as e:
-                app.logger.warning(f"Batch {batch_id}: Network/Request Error for {url_to_scrape}: {e}")
-            except Exception as e:
-                app.logger.error(f"Batch {batch_id}: Unexpected error processing {url_to_scrape}: {e}")
-                
-        # --- END SCRAPING LOGIC ---
-        
-        # Mark batch as COMPLETED
-        Batch.query.filter_by(id=batch_id).update({
-            'status': 'COMPLETED',
-            'finished_at': datetime.utcnow()
-        })
-        db.session.commit()
-        app.logger.info(f"Batch {batch_id} completed successfully. Found {len(found_emails)} emails.")
+                    # File Extension Filter: Skip if it ends like a common file
+                    is_file_extension = any(email_lower.endswith(ext) for ext in FILE_EXTENSIONS)
+                    
+                    if is_file_extension:
+                        continue 
 
-    except Exception as e:
-        # Mark batch as FAILED in case of a critical error
-        app.logger.error(f"Critical failure in scrape_task for Batch {batch_id}: {e}")
-        try:
-            Batch.query.filter_by(id=batch_id).update({
-                'status': 'FAILED',
-                'finished_at': datetime.utcnow(),
-                'error_message': f"Critical failure: {e}" 
-            })
+                    # Domain Relevance Filter: Keep if it matches the target domain or is a common prefix
+                    if email_domain == expected_domain or email_prefix in common_info_prefixes:
+                        filtered_emails.add(email_lower)
+                
+                app.logger.info(f"Filtered down to {len(filtered_emails)} unique relevant emails.")
+
+
+                # 3. Save emails and link them to the TargetURL (Transactional)
+                with app.app_context():
+                    
+                    emails_to_link = []
+
+                    for email_address in filtered_emails:
+                        
+                        # Check local batch tracker first (avoids duplicate DB query per batch)
+                        if email_address not in unique_emails_in_batch:
+                            
+                            # Check database globally
+                            email_obj = db.session.scalar(
+                                select(Email).filter_by(address=email_address)
+                            )
+                            
+                            if not email_obj:
+                                # Create a new Email object if it doesn't exist
+                                email_obj = Email(
+                                    address=email_address, 
+                                    first_found_batch_id=batch_id,
+                                    domain=get_email_domain(email_address)
+                                )
+                                db.session.add(email_obj)
+                                db.session.flush() # Ensure object gets an ID before session commit
+                                
+                            # Add to batch tracker for future URLs in this batch
+                            unique_emails_in_batch[email_address] = email_obj
+                        else:
+                            # Use the existing object from the batch tracker
+                            email_obj = unique_emails_in_batch[email_address]
+                            
+                        emails_to_link.append(email_obj)
+
+                    # Update TargetURL with status and results
+                    target_url_obj = db.session.get(TargetURL, url_id)
+                    target_url_obj.status = "COMPLETED"
+                    target_url_obj.found_emails.extend(emails_to_link)
+                    db.session.commit()
+
+
+            except requests.exceptions.RequestException as e:
+                app.logger.error(f"Request error for {url_full}: {e}")
+                with app.app_context():
+                    target_url_obj = db.session.get(TargetURL, url_id)
+                    target_url_obj.status = "FAILED"
+                    target_url_obj.error_message = f"Request error: {str(e)[:250]}"
+                    db.session.commit()
+            
+            except Exception as e:
+                app.logger.error(f"General error during scraping {url_full}: {e}")
+                with app.app_context():
+                    target_url_obj = db.session.get(TargetURL, url_id)
+                    target_url_obj.status = "FAILED"
+                    target_url_obj.error_message = f"Internal error: {str(e)[:250]}"
+                    db.session.commit()
+
+
+        # 4. Finalize Batch Status
+        with app.app_context():
+            # Check if all TargetURLs are COMPLETED or FAILED
+            pending_count = db.session.scalar(
+                select(func.count(TargetURL.id))
+                .filter(TargetURL.batch_id == batch_id)
+                .filter(TargetURL.status == "IN_PROGRESS")
+            )
+
+            batch = db.session.get(Batch, batch_id)
+            batch.end_time = datetime.now()
+            
+            if pending_count == 0:
+                batch.status = "COMPLETED"
+                app.logger.info(f"Batch {batch_id} finished successfully.")
+            else:
+                # If any are still IN_PROGRESS (shouldn't happen if error handling is perfect)
+                batch.status = "FAILED" 
+                app.logger.error(f"Batch {batch_id} finished with {pending_count} pending URLs.")
+
             db.session.commit()
-        except Exception as rollback_e:
-            app.logger.error(f"Failed to update status to FAILED for Batch {batch_id}: {rollback_e}")
+            
+    except Exception as e:
+        app.logger.error(f"Unrecoverable error in scrape_task for batch {batch_id}: {e}")
+        # Mark batch as FAILED if an exception was raised outside the inner loop
+        with app.app_context():
+            batch = db.session.get(Batch, batch_id)
+            if batch:
+                batch.status = "FAILED"
+                db.session.commit()
 
 # --- API Endpoints ---
 
